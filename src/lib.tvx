@@ -1,0 +1,4 @@
+# The aws package: `aws.s3`, `aws.credentials` and `aws.sigv4`. This file is its entry, which `tvpm` checks.
+from s3 import client
+from credentials import load
+from sigv4 import sign
