@@ -1,0 +1,6 @@
+[package]
+name = "minio_check"
+version = "0.1.0"
+
+[dependencies]
+aws = { path = "../.." }

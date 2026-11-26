@@ -1,0 +1,99 @@
+# AWS Signature Version 4: the `authorization` header of a request.
+# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html
+
+from std.bytes import Bytes
+
+let UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+
+# The keys that sign a request. `session_token` is set for temporary credentials (a role).
+type Credentials:
+    access_key: Text
+    secret_key: Text
+    session_token: Text?
+
+# What is signed. `path` and the keys and values of `query` are not encoded yet.
+type Request:
+    method: Text
+    host: Text
+    path: Text
+    query: Map[Text, Text]
+    headers: Map[Text, Text]
+    payload_hash: Text
+
+fn sha256_hex(data: Bytes) -> Text:
+    std.encoding.hex(std.crypto.sha256(data))
+
+fn hmac(key: Bytes, text: Text) -> Bytes:
+    std.crypto.hmac_sha256(key, std.bytes.from_text(text))
+
+# Percent-encodes everything but the unreserved characters (and `/` when `keep_slash`), in upper-case hex, as AWS wants.
+fn uri_encode(text: Text, keep_slash: Bool) -> Text:
+    var out = ""
+    for c in text.chars():
+        if UNRESERVED.contains(c) or (keep_slash and c == "/"):
+            out = out + c
+        else:
+            let hex = std.text.uppercase(std.encoding.hex(std.bytes.from_text(c)))
+            var i = 0
+            while i < hex.chars().len():
+                out = out + "%" + hex.slice(i, i + 2)
+                i = i + 2
+    out
+
+fn canonical_query(query: Map[Text, Text]) -> Text:
+    let parts: List[Text] = []
+    for k, v in query.entries():
+        parts.push(uri_encode(k, False) + "=" + uri_encode(v, False))
+    parts.sort()
+    std.text.join(parts, "&")
+
+# The canonical request, the string to sign and the signature, for a request at `amz_date` (`YYYYMMDDTHHMMSSZ`).
+# S3 encodes the path once; the other services twice (`double_encode`).
+fn signature(req: Request, creds: Credentials, region: Text, service: Text, amz_date: Text, double_encode: Bool) -> (Text, Text):
+    let headers: Map[Text, Text] = std.map.new()
+    for k, v in req.headers.entries():
+        headers.insert(k.to_lowercase(), v.trim())
+    headers.insert("host", req.host)
+    headers.insert("x-amz-date", amz_date)
+    match creds.session_token:
+        case Some(token):
+            headers.insert("x-amz-security-token", token)
+        case None:
+            pass
+    var canonical_headers = ""
+    for k, v in headers.entries():
+        canonical_headers = canonical_headers + k + ":" + v + "\n"
+    let signed_headers = std.text.join(headers.keys(), ";")
+    var path = uri_encode(req.path, True)
+    if double_encode:
+        path = uri_encode(path, True)
+    if path.is_empty():
+        path = "/"
+    let canonical = std.text.join([req.method, path, canonical_query(req.query), canonical_headers, signed_headers, req.payload_hash], "\n")
+    let date = amz_date.slice(0, 8)
+    let scope = f"{date}/{region}/{service}/aws4_request"
+    let to_sign = std.text.join(["AWS4-HMAC-SHA256", amz_date, scope, sha256_hex(std.bytes.from_text(canonical))], "\n")
+    let k_date = hmac(std.bytes.from_text("AWS4" + creds.secret_key), date)
+    let k_signing = hmac(hmac(hmac(k_date, region), service), "aws4_request")
+    let sig = std.encoding.hex(hmac(k_signing, to_sign))
+    (f"AWS4-HMAC-SHA256 Credential={creds.access_key}/{scope}, SignedHeaders={signed_headers}, Signature={sig}", canonical)
+
+# The headers to send with `req`, signed at the time `now` (seconds since 1970, `std.time.now()`): its own headers and
+# `authorization`, `x-amz-date`, `x-amz-content-sha256` and, for temporary credentials, `x-amz-security-token`.
+fn sign(req: Request, creds: Credentials, region: Text, service: Text, now: Float) -> Map[Text, Text]:
+    let amz_date = std.time.format(now, "%Y%m%dT%H%M%SZ")
+    let headers: Map[Text, Text] = std.map.new()
+    for k, v in req.headers.entries():
+        headers.insert(k, v)
+    if service == "s3":
+        headers.insert("x-amz-content-sha256", req.payload_hash)
+    let signed = Request(method: req.method, host: req.host, path: req.path, query: req.query, headers: headers, payload_hash: req.payload_hash)
+    let (authorization, _) = signature(signed, creds, region, service, amz_date, service != "s3")
+    headers.insert("authorization", authorization)
+    headers.insert("x-amz-date", amz_date)
+    match creds.session_token:
+        case Some(token):
+            headers.insert("x-amz-security-token", token)
+        case None:
+            pass
+    headers

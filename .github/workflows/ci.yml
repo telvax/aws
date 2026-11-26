@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The package needs std.crypto, std.bytes and std.http.client, which are in the `develop` branch of Telvax and not
+      # yet in a release. Once a release has them, this becomes the install script (scripts/install.sh) of Telvax.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Telvax from develop
+        run: cargo install --locked --git https://github.com/telvax/telvax --branch develop telvax_cli telvax_pkg
+      - name: Check, format and unit tests
+        run: |
+          for f in src/*.tvx; do telvax check "$f"; telvax fmt --check "$f"; done
+          for f in src/*_test.tvx; do telvax test "$f"; done
+      - name: Start MinIO
+        run: |
+          docker run -d -p 9000:9000 -e MINIO_ROOT_USER=telvaxkey -e MINIO_ROOT_PASSWORD=telvaxsecret minio/minio server /data
+          for i in $(seq 1 30); do curl -fs http://localhost:9000/minio/health/live && break; sleep 1; done
+      - name: S3 calls against MinIO
+        working-directory: tests/minio
+        env:
+          AWS_ACCESS_KEY_ID: telvaxkey
+          AWS_SECRET_ACCESS_KEY: telvaxsecret
+          AWS_REGION: us-east-1
+          AWS_ENDPOINT_URL_S3: http://localhost:9000
+        run: |
+          out="$(tvpm run main)"
+          echo "$out"
+          echo "$out" | grep -q '^Ok("True 19 True'

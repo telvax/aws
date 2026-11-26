@@ -1,0 +1,143 @@
+# Amazon S3: put, get, head, delete and list objects. Any S3-compatible server (MinIO, LocalStack) works through `endpoint`.
+from std.bytes import Bytes
+from std.http.client import HttpResponse
+from sigv4 import Credentials, Request, sign, sha256_hex, uri_encode, canonical_query
+from credentials import load, region, env
+
+# A client. `endpoint` is empty for AWS; otherwise the address of a compatible server (`http://localhost:9000`), which is
+# reached with the bucket in the path.
+type S3:
+    region: Text
+    credentials: Credentials
+    endpoint: Text
+
+# An object as `list_objects` and `head_object` give it.
+type Object:
+    key: Text
+    size: Int
+    etag: Text
+    last_modified: Text
+
+# A client from the environment: the credential chain, `AWS_REGION`, and `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` when set.
+fn client() -> Result[S3, Text]:
+    let endpoint = env("AWS_ENDPOINT_URL_S3") if not env("AWS_ENDPOINT_URL_S3").is_empty() else env("AWS_ENDPOINT_URL")
+    Ok(S3(region: region()?, credentials: load()?, endpoint: endpoint))
+
+fn no_entries() -> Map[Text, Text]:
+    std.map.new()
+
+# The host, the path to sign and the start of the URL of an object.
+fn target(s3: S3, bucket: Text, key: Text) -> (Text, Text, Text):
+    if s3.endpoint.is_empty():
+        let host = f"{bucket}.s3.{s3.region}.amazonaws.com"
+        return (host, "/" + key, "https://" + host)
+    var base = s3.endpoint
+    if base.ends_with("/"):
+        base = base.slice(0, -1)
+    let scheme = "https://" if base.starts_with("https://") else "http://"
+    let host = base.slice(scheme.chars().len(), base.chars().len())
+    (host, "/" + bucket + "/" + key, base)
+
+# The text of a tag of an XML answer, with the five entities of XML decoded.
+fn tag(xml: Text, name: Text) -> Text?:
+    let parts = xml.split("<" + name + ">")
+    if parts.len() < 2:
+        return None
+    let inner = parts.get(1).unwrap().split("</" + name + ">").get(0).unwrap()
+    Some(inner.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&"))
+
+fn failure(resp: HttpResponse) -> Text:
+    let body = resp.text().unwrap_or("")
+    let code = tag(body, "Code").unwrap_or("")
+    let message = tag(body, "Message").unwrap_or("")
+    if code.is_empty():
+        return f"S3 answered {resp.status()}"
+    f"S3 answered {resp.status()}: {code}: {message}"
+
+# Signs and sends one request.
+fn send(s3: S3, method: Text, bucket: Text, key: Text, query: Map[Text, Text], headers: Map[Text, Text], body: Bytes) -> Result[HttpResponse, Text]:
+    let (host, path, base) = target(s3, bucket, key)
+    let req = Request(method: method, host: host, path: path, query: query, headers: headers, payload_hash: sha256_hex(body))
+    let signed = sign(req, s3.credentials, s3.region, "s3", std.time.now())
+    var url = base + uri_encode(path, True)
+    if not query.is_empty():
+        url = url + "?" + canonical_query(query)
+    if method == "PUT":
+        return std.http.client.put(url, body, signed)
+    if method == "HEAD":
+        return std.http.client.head(url, signed)
+    if method == "DELETE":
+        return std.http.client.delete(url, signed)
+    std.http.client.get(url, signed)
+
+# The value of a function that gives nothing (Telvax has no `()` literal).
+fn done():
+    pass
+
+fn nothing() -> Bytes:
+    std.bytes.from_text("")
+
+# Writes an object. `content_type` is stored with it, and given back to whoever reads it over HTTP.
+fn put_object(s3: S3, bucket: Text, key: Text, body: Bytes, content_type: Text) -> Result[(), Text]:
+    let headers = no_entries()
+    headers.insert("content-type", content_type)
+    let resp = send(s3, "PUT", bucket, key, no_entries(), headers, body)?
+    if not resp.ok():
+        return Err(failure(resp))
+    Ok(done())
+
+# Reads an object.
+fn get_object(s3: S3, bucket: Text, key: Text) -> Result[Bytes, Text]:
+    let resp = send(s3, "GET", bucket, key, no_entries(), no_entries(), nothing())?
+    if not resp.ok():
+        return Err(failure(resp))
+    Ok(resp.bytes())
+
+# The size, the ETag and the date of an object, or `None` when there is no such object.
+fn head_object(s3: S3, bucket: Text, key: Text) -> Result[Object?, Text]:
+    let resp = send(s3, "HEAD", bucket, key, no_entries(), no_entries(), nothing())?
+    if resp.status() == 404:
+        return Ok(None)
+    if not resp.ok():
+        return Err(f"S3 answered {resp.status()}")
+    let size = resp.header("content-length").unwrap_or("0").to_int().unwrap_or(0)
+    Ok(Some(Object(key: key, size: size, etag: resp.header("etag").unwrap_or(""), last_modified: resp.header("last-modified").unwrap_or(""))))
+
+# Deletes an object. Deleting one that does not exist is not an error, as in S3.
+fn delete_object(s3: S3, bucket: Text, key: Text) -> Result[(), Text]:
+    let resp = send(s3, "DELETE", bucket, key, no_entries(), no_entries(), nothing())?
+    if not resp.ok():
+        return Err(failure(resp))
+    Ok(done())
+
+# Every object whose key starts with `prefix`, in key order, following the pages of ListObjectsV2.
+fn list_objects(s3: S3, bucket: Text, prefix: Text) -> Result[List[Object], Text]:
+    let out: List[Object] = []
+    var token = ""
+    while True:
+        let query = no_entries()
+        query.insert("list-type", "2")
+        query.insert("prefix", prefix)
+        if not token.is_empty():
+            query.insert("continuation-token", token)
+        let resp = send(s3, "GET", bucket, "", query, no_entries(), nothing())?
+        if not resp.ok():
+            return Err(failure(resp))
+        let xml = resp.text()?
+        for block in xml.split("<Contents>").skip(1):
+            let size = tag(block, "Size").unwrap_or("0").to_int().unwrap_or(0)
+            out.push(Object(key: tag(block, "Key").unwrap_or(""), size: size, etag: tag(block, "ETag").unwrap_or(""), last_modified: tag(block, "LastModified").unwrap_or("")))
+        if tag(xml, "IsTruncated").unwrap_or("false") != "true":
+            break
+        token = tag(xml, "NextContinuationToken").unwrap_or("")
+    Ok(out)
+
+# Creates a bucket. Outside `us-east-1` the region goes in the body, as S3 asks.
+fn create_bucket(s3: S3, bucket: Text) -> Result[(), Text]:
+    var body = ""
+    if s3.region != "us-east-1":
+        body = f"<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>{s3.region}</LocationConstraint></CreateBucketConfiguration>"
+    let resp = send(s3, "PUT", bucket, "", no_entries(), no_entries(), std.bytes.from_text(body))?
+    if not resp.ok():
+        return Err(failure(resp))
+    Ok(done())

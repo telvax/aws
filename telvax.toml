@@ -1,0 +1,6 @@
+[package]
+name = "aws"
+version = "0.1.0"
+edition = "2026"
+description = "AWS for Telvax: SigV4 request signing, the credential chain and S3"
+license = "MIT OR Apache-2.0"

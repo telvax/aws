@@ -1,0 +1,20 @@
+# Puts, reads, lists and deletes objects on an S3-compatible server, with the credentials and the endpoint of the
+# environment (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT_URL_S3). Prints what it saw.
+from aws.s3 import client, create_bucket, put_object, get_object, head_object, delete_object, list_objects
+
+fn main() -> Result[Text, Text]:
+    let s3 = client()?
+    create_bucket(s3, "telvax-check")?
+    let data = std.bytes.from_text("ano,valor\n2023,1.5\n")
+    put_object(s3, "telvax-check", "bndes/2023/11/26/dados.csv", data, "text/csv")?
+    put_object(s3, "telvax-check", "bndes/2023/11/26/com espaço & ç.csv", data, "text/csv")?
+    for i in range(3):
+        put_object(s3, "telvax-check", f"many/{i}.txt", std.bytes.from_text(f"{i}"), "text/plain")?
+    let back = get_object(s3, "telvax-check", "bndes/2023/11/26/dados.csv")?.to_text()?
+    let info = head_object(s3, "telvax-check", "bndes/2023/11/26/com espaço & ç.csv")?.unwrap()
+    let missing = head_object(s3, "telvax-check", "nope")?
+    let listed = list_objects(s3, "telvax-check", "bndes/")? |> std.iter.map(o => f"{o.key}:{o.size}")
+    delete_object(s3, "telvax-check", "bndes/2023/11/26/dados.csv")?
+    let after = list_objects(s3, "telvax-check", "bndes/")?.len()
+    let wrong = get_object(s3, "telvax-check", "nope")
+    Ok(f"{back == "ano,valor\n2023,1.5\n"} {info.size} {missing.is_none()} {listed} {after} {list_objects(s3, "telvax-check", "many/")?.len()} {wrong}")
